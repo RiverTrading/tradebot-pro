@@ -218,6 +218,19 @@ class PostgreSQLBackend(StorageBackend):
                         str(amount.locked),
                     )
 
+    async def sync_pnl(self, timestamp: int, pnl: float, unrealized_pnl: float) -> None:
+        async with self._pg_async.acquire() as conn:
+            await conn.execute(
+                f"INSERT INTO {self.table_prefix}_pnl "
+                "(timestamp, pnl, unrealized_pnl) VALUES ($1, $2, $3) "
+                "ON CONFLICT (timestamp) DO UPDATE SET "
+                "pnl = EXCLUDED.pnl, "
+                "unrealized_pnl = EXCLUDED.unrealized_pnl",
+                int(timestamp),
+                float(pnl),
+                float(unrealized_pnl),
+            )
+
     def get_order(
         self,
         oid: str,

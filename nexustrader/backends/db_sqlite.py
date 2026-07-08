@@ -217,6 +217,15 @@ class SQLiteBackend(StorageBackend):
                     )
             await self._db_async.commit()
 
+    async def sync_pnl(self, timestamp: int, pnl: float, unrealized_pnl: float) -> None:
+        async with self._db_async.cursor() as cursor:
+            await cursor.execute(
+                f"INSERT OR REPLACE INTO {self.table_prefix}_pnl "
+                "(timestamp, pnl, unrealized_pnl) VALUES (?, ?, ?)",
+                (timestamp, pnl, unrealized_pnl),
+            )
+            await self._db_async.commit()
+
     def get_order(
         self,
         oid: str,

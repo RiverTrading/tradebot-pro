@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from decimal import Decimal
 from typing import Dict
@@ -397,3 +399,69 @@ async def test_initialize_overwrite_check(
     assert (
         len(position) == 0
     )  # since we overwrite the balance, the position is not in db
+
+
+############################ TEST PNL PERSISTENCE ############################
+
+# Regression tests: the storage-backend refactor removed AsyncCache._sync_pnl
+# while MockLinearConnector still calls it from _handle_pnl_update() and
+# disconnect(), crashing mock trading sessions with AttributeError.
+
+
+async def test_pnl_snapshot_persisted_and_disconnect(
+    mock_linear_connector: MockLinearConnector,
+):
+    cache = mock_linear_connector._cache
+    await cache._init_storage()
+    await mock_linear_connector._init_balance()
+    await mock_linear_connector._init_position()
+
+    ts = _live_clock.timestamp_ms()
+    await cache._sync_pnl(ts, 10000.0, -25.5)
+    # Writing the same timestamp again must upsert on the PRIMARY KEY, not raise
+    await cache._sync_pnl(ts, 10001.0, -20.0)
+
+    cursor = cache._backend._get_cursor()
+    cursor.execute(
+        f"SELECT pnl, unrealized_pnl FROM {cache._backend.table_prefix}_pnl "
+        "WHERE timestamp = ?",
+        (ts,),
+    )
+    assert cursor.fetchall() == [(10001.0, -20.0)]
+
+    # disconnect() persists a final snapshot through the same path
+    await mock_linear_connector.disconnect()
+
+
+async def test_handle_pnl_update_survives_a_cycle(
+    exchange, task_manager, message_bus, cache
+):
+    connector = MockLinearConnector(
+        initial_balance={"USDT": 10000, "BTC": 0},
+        account_type=BinanceAccountType.LINEAR_MOCK,
+        exchange=exchange,
+        msgbus=message_bus,
+        clock=_live_clock,
+        cache=cache,
+        task_manager=task_manager,
+        overwrite_balance=True,
+        overwrite_position=True,
+        fee_rate=0.0005,
+        quote_currency="USDT",
+        update_interval=1,
+        leverage=1,
+    )
+    await cache._init_storage()
+    await connector._init_balance()
+    await connector._init_position()
+
+    task = asyncio.create_task(connector._handle_pnl_update())
+    await asyncio.sleep(1.2)  # let one update cycle (update_interval=1s) complete
+    try:
+        assert not task.done(), task.exception()
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
