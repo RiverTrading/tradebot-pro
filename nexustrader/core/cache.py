@@ -218,6 +218,10 @@ class AsyncCache:
     async def sync_params(self):
         await self._backend.sync_params(self._mem_params)
 
+    async def _sync_pnl(self, timestamp: int, pnl: float, unrealized_pnl: float):
+        """Persist a PnL snapshot; called periodically by MockLinearConnector."""
+        await self._backend.sync_pnl(timestamp, pnl, unrealized_pnl)
+
     def _cleanup_expired_data(self):
         """Cleanup expired data"""
         current_time = self._clock.timestamp_ms()

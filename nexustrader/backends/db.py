@@ -54,6 +54,10 @@ class StorageBackend(ABC):
         pass
 
     @abstractmethod
+    async def sync_pnl(self, timestamp: int, pnl: float, unrealized_pnl: float) -> None:
+        pass
+
+    @abstractmethod
     def get_order(
         self,
         oid: str,
