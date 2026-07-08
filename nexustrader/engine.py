@@ -252,6 +252,7 @@ class Engine:
                             quote_currency=mock_conn_config.quote_currency,
                             update_interval=mock_conn_config.update_interval,
                             leverage=mock_conn_config.leverage,
+                            registry=self._registry,
                         )
                         self._private_connectors[account_type] = private_connector
                     elif mock_conn_config.account_type.is_inverse_mock:

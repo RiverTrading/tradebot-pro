@@ -25,6 +25,7 @@ from nexustrader.schema import (
 from nexustrader.constants import ExchangeType, AccountType
 from nexustrader.core.cache import AsyncCache
 from nexustrader.core.entity import TaskManager
+from nexustrader.core.registry import OrderRegistry
 from nexustrader.error import OrderError
 from nexustrader.constants import (
     OrderSide,
@@ -497,6 +498,7 @@ class MockLinearConnector:
         quote_currency: str = "USDT",
         update_interval: int = 60,  # seconds
         leverage: int = 1,
+        registry: OrderRegistry | None = None,
     ):
         self._account_type = account_type
         self._market = exchange.market
@@ -514,6 +516,11 @@ class MockLinearConnector:
         self._task_manager = task_manager
         self._leverage = leverage
         self._log = Logger(name=type(self).__name__)
+        self._registry = registry or OrderRegistry()
+        # The EMS submit handlers and the engine dispatch order operations
+        # through `private_connector._oms`. The mock connector executes
+        # orders itself, so it serves as its own OMS.
+        self._oms = self
 
     async def _init_position(self):
         for _, position in self._cache._get_all_positions_from_db(
@@ -537,8 +544,9 @@ class MockLinearConnector:
         self._cache._apply_balance(self._account_type, balances)
         await self._cache.sync_balances()
 
-    async def cancel_order(self, symbol: str, order_id: str, **kwargs) -> Order:
-        """Cancel an order"""
+    async def cancel_order(self, oid: str, symbol: str, **kwargs) -> Order:
+        """Cancel an order. Mock orders fill immediately, so there is never
+        anything to cancel."""
         pass
 
     async def cancel_all_orders(self, symbol: str) -> bool:
@@ -553,8 +561,11 @@ class MockLinearConnector:
         amount: Decimal,
         price: Decimal | None = None,
         time_in_force: TimeInForce = TimeInForce.GTC,
+        oid: str | None = None,
+        reduce_only: bool = False,
         **kwargs,
     ) -> Order:
+        oid = oid or UUID4().value
         try:
             if amount <= 0:
                 raise OrderError(f"Invalid order amount {amount}")
@@ -614,15 +625,13 @@ class MockLinearConnector:
             fee = amount * Decimal(str(price)) * Decimal(str(self._fee_rate))
             fee_currency = market.quote
 
-            reduce_only = kwargs.get("reduce_only", False)
-
             cost = amount * Decimal(str(price))
 
             order = Order(
                 exchange=self._exchange_id,
                 symbol=symbol,
                 status=OrderStatus.PENDING,
-                oid=UUID4().value,
+                oid=oid,
                 amount=amount,
                 filled=Decimal(0),
                 timestamp=self._clock.timestamp_ms(),
@@ -661,14 +670,17 @@ class MockLinearConnector:
             )
 
             self._apply_position(order)
-            self._msgbus.send(
-                endpoint=f"{self._exchange_id.value}.order", msg=order_filled
-            )
+            # Nothing consumes the "{exchange_id}.order" endpoint since the
+            # OMS refactor; dispatch the status updates directly so the cache
+            # and the strategy callbacks stay in sync.
+            self._order_status_update(order)
+            self._order_status_update(order_filled)
             return order
         except OrderError as e:
             self._log.error(f"Error creating order: {e}")
-            return Order(
+            failed_order = Order(
                 exchange=self._exchange_id,
+                oid=oid,
                 timestamp=self._clock.timestamp_ms(),
                 symbol=symbol,
                 status=OrderStatus.FAILED,
@@ -680,6 +692,49 @@ class MockLinearConnector:
                 filled=Decimal(0),
                 remaining=amount,
             )
+            self._order_status_update(failed_order)
+            return failed_order
+
+    def _order_status_update(self, order: Order):
+        """Dispatch an order status update the way OrderManagementSystem does.
+
+        Orders submitted outside the EMS path (oid not registered) update
+        neither the cache nor the strategy callbacks, matching the previous
+        behaviour of direct calls.
+        """
+        if not self._registry.is_registered(order.oid):
+            return
+        if not self._cache.update_order_status(order):
+            return
+        match order.status:
+            case OrderStatus.PENDING:
+                self._msgbus.send(endpoint="pending", msg=order)
+            case OrderStatus.FAILED:
+                self._msgbus.send(endpoint="failed", msg=order)
+            case OrderStatus.FILLED:
+                self._msgbus.send(endpoint="filled", msg=order)
+        if order.is_closed:
+            self._registry.unregister_order(order.oid)
+            self._registry.unregister_tmp_order(order.oid)
+
+    async def modify_order(self, *args, **kwargs) -> None:
+        self._log.error("modify_order is not supported by the mock connector")
+
+    async def create_tp_sl_order(self, *args, **kwargs) -> None:
+        self._log.error("create_tp_sl_order is not supported by the mock connector")
+
+    async def create_batch_orders(self, *args, **kwargs) -> None:
+        self._log.error("create_batch_orders is not supported by the mock connector")
+
+    async def create_order_ws(self, *args, **kwargs) -> None:
+        self._log.error(
+            "create_order_ws is not supported by the mock connector; use create_order"
+        )
+
+    async def cancel_order_ws(self, *args, **kwargs) -> None:
+        self._log.error(
+            "cancel_order_ws is not supported by the mock connector; use cancel_order"
+        )
 
     @property
     def pnl(self) -> float:

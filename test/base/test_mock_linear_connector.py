@@ -2,7 +2,7 @@ import pytest
 from decimal import Decimal
 from typing import Dict
 from nexustrader.schema import PositionSide
-from nexustrader.constants import OrderStatus, OrderSide, OrderType
+from nexustrader.constants import OrderStatus, OrderSide, OrderType, TimeInForce
 from nexustrader.exchange.binance.constants import BinanceAccountType
 from nexustrader.core.nautilius_core import LiveClock
 from nexustrader.base import MockLinearConnector
@@ -397,3 +397,125 @@ async def test_initialize_overwrite_check(
     assert (
         len(position) == 0
     )  # since we overwrite the balance, the position is not in db
+
+
+############################ TEST EMS SUBMIT PATH ############################
+
+# Regression tests: the OMS refactor routed the EMS submit handlers through
+# `private_connector._oms.<op>(...)`, but MockLinearConnector had no `_oms`
+# attribute. Every order submitted via Strategy.create_order() crashed with
+# AttributeError and no fill ever reached the cache or strategy callbacks.
+
+
+async def test_ems_create_order_path(
+    mock_linear_connector: MockLinearConnector, message_bus
+):
+    connector = mock_linear_connector
+    await connector._cache._init_storage()
+    await connector._init_balance()
+    await connector._init_position()
+
+    received = []
+    message_bus.register(endpoint="pending", handler=received.append)
+    message_bus.register(endpoint="filled", handler=received.append)
+
+    symbol = "BTCUSDT-PERP.BINANCE"
+    oid = "ems-oid-1"
+    # mimic what the EMS does before dispatching to connector._oms
+    connector._registry.register_order(oid)
+    connector._cache.add_inflight_order(symbol, oid)
+
+    order = await connector._oms.create_order(
+        oid=oid,
+        symbol=symbol,
+        side=OrderSide.BUY,
+        type=OrderType.MARKET,
+        amount=Decimal("1"),
+        price=None,
+        time_in_force=TimeInForce.GTC,
+        reduce_only=False,
+    )
+
+    assert order.oid == oid  # the EMS-generated oid is honored
+    assert [o.status for o in received] == [OrderStatus.PENDING, OrderStatus.FILLED]
+    assert all(o.oid == oid for o in received)
+
+    cached = connector._cache.get_order(oid)
+    assert cached is not None
+    assert cached.status == OrderStatus.FILLED
+    assert connector._cache.get_inflight_orders(symbol) == set()
+    assert not connector._registry.is_registered(oid)
+
+    position = connector._cache.get_position(symbol)
+    assert position.amount == Decimal("1")
+
+
+async def test_ems_failed_order_reaches_strategy(
+    mock_linear_connector: MockLinearConnector, message_bus
+):
+    connector = mock_linear_connector
+    await connector._cache._init_storage()
+    await connector._init_balance()
+    await connector._init_position()
+
+    received = []
+    message_bus.register(endpoint="failed", handler=received.append)
+
+    oid = "ems-oid-failed-1"
+    connector._registry.register_order(oid)
+    order = await connector._oms.create_order(
+        oid=oid,
+        symbol="BTC-USD",  # unknown market -> OrderError
+        side=OrderSide.BUY,
+        type=OrderType.MARKET,
+        amount=Decimal("1"),
+        price=None,
+        time_in_force=TimeInForce.GTC,
+        reduce_only=False,
+    )
+
+    assert order.status == OrderStatus.FAILED
+    assert order.oid == oid
+    assert [o.oid for o in received] == [oid]
+    assert not connector._registry.is_registered(oid)
+
+
+async def test_direct_create_order_generates_oid(
+    mock_linear_connector: MockLinearConnector, message_bus
+):
+    """Direct calls (bypassing the EMS) keep working: an oid is generated
+    and no strategy callbacks fire for unregistered orders."""
+    connector = mock_linear_connector
+    await connector._cache._init_storage()
+    await connector._init_balance()
+    await connector._init_position()
+
+    received = []
+    message_bus.register(endpoint="filled", handler=received.append)
+
+    order = await connector.create_order(
+        symbol="BTCUSDT-PERP.BINANCE",
+        side=OrderSide.BUY,
+        type=OrderType.LIMIT,
+        amount=Decimal("1"),
+    )
+    assert order.status == OrderStatus.PENDING
+    assert order.oid
+    assert received == []
+
+
+async def test_unsupported_ems_operations_do_not_raise(
+    mock_linear_connector: MockLinearConnector,
+):
+    """The EMS submit loop awaits some of these directly; raising would kill
+    the queue consumer task."""
+    connector = mock_linear_connector
+    await connector._oms.modify_order(
+        oid="x", symbol="s", side=None, price=None, amount=None
+    )
+    await connector._oms.create_tp_sl_order(oid="x", symbol="s")
+    await connector._oms.create_batch_orders(orders=[])
+    await connector._oms.create_order_ws(oid="x", symbol="s")
+    await connector._oms.cancel_order_ws(oid="x", symbol="s")
+    await connector._oms.cancel_order(oid="x", symbol="s")
+    await connector._oms.cancel_all_orders("s")
